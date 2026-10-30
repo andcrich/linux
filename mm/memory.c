@@ -2204,6 +2204,8 @@ static void __zap_vma_range(struct mmu_gather *tlb, struct vm_area_struct *vma,
 		} while (pgd++, addr = next, addr != end);
 		tlb_end_vma(tlb, vma);
 	}
+	if (!reaping)
+		aprobe_munmap(vma, start, end);
 }
 
 /**

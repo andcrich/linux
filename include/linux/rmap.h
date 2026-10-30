@@ -67,6 +67,22 @@ struct anon_vma {
 	struct rb_root_cached rb_root;
 };
 
+#ifdef CONFIG_MMU
+static inline void get_anon_vma(struct anon_vma *anon_vma)
+{
+	atomic_inc(&anon_vma->refcount);
+}
+
+void __put_anon_vma(struct anon_vma *anon_vma);
+
+static inline void put_anon_vma(struct anon_vma *anon_vma)
+{
+	if (atomic_dec_and_test(&anon_vma->refcount))
+		__put_anon_vma(anon_vma);
+}
+
+#endif
+
 /*
  * The copy-on-write semantics of fork mean that an anon_vma
  * can become associated with multiple processes. Furthermore,

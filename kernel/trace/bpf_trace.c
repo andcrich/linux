@@ -2979,6 +2979,7 @@ struct bpf_uprobe_multi_link {
 	u32 cnt;
 	struct bpf_uprobe *uprobes;
 	struct task_struct *task;
+	struct mm_struct *mm;
 };
 
 struct bpf_uprobe_multi_run_ctx {
@@ -3006,7 +3007,10 @@ static void bpf_uprobe_multi_link_release(struct bpf_link *link)
 	bpf_uprobe_unregister(umulti_link->uprobes, umulti_link->cnt);
 	if (umulti_link->task)
 		put_task_struct(umulti_link->task);
-	path_put(&umulti_link->path);
+	if (umulti_link->mm)
+		mmdrop(umulti_link->mm);
+	if (umulti_link->path.dentry)
+		path_put(&umulti_link->path);
 }
 
 static void bpf_uprobe_multi_link_dealloc(struct bpf_link *link)
@@ -3043,6 +3047,12 @@ static int bpf_uprobe_multi_link_fill_link_info(const struct bpf_link *link,
 	info->uprobe_multi.flags = umulti_link->link.flags;
 	info->uprobe_multi.pid = umulti_link->task ?
 				 task_pid_nr_ns(umulti_link->task, task_active_pid_ns(current)) : 0;
+	if (umulti_link->mm) {
+		if (upath || upath_size)
+			return -EINVAL;
+		info->uprobe_multi.path_size = 0;
+		goto offsets;
+	}
 
 	upath_size = upath_size ? min_t(u32, upath_size, PATH_MAX) : PATH_MAX;
 	buf = kmalloc(upath_size, GFP_KERNEL);
@@ -3062,6 +3072,7 @@ static int bpf_uprobe_multi_link_fill_link_info(const struct bpf_link *link,
 		return -EFAULT;
 	info->uprobe_multi.path_size = upath_size;
 
+offsets:
 	if (!uoffsets && !ucookies && !uref_ctr_offsets)
 		return 0;
 
@@ -3094,6 +3105,11 @@ static void bpf_uprobe_multi_show_fdinfo(const struct bpf_link *link,
 	pid_t pid;
 
 	umulti_link = container_of(link, struct bpf_uprobe_multi_link, link);
+	if (umulti_link->mm) {
+		seq_printf(seq, "aprobe_cnt:\t%u\npid:\t%u\n",
+			   umulti_link->cnt, task_tgid_nr(umulti_link->task));
+		return;
+	}
 
 	buf = kmalloc(PATH_MAX, GFP_KERNEL);
 	if (!buf)
@@ -3183,7 +3199,8 @@ uprobe_multi_link_filter(struct uprobe_consumer *con, struct mm_struct *mm)
 	struct bpf_uprobe *uprobe;
 
 	uprobe = container_of(con, struct bpf_uprobe, consumer);
-	return uprobe->link->task->mm == mm;
+	return uprobe->link->mm ? uprobe->link->mm == mm :
+		uprobe->link->task->mm == mm;
 }
 
 static int
@@ -3268,11 +3285,13 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	struct bpf_link_primer link_primer;
 	struct bpf_uprobe *uprobes = NULL;
 	struct task_struct *task = NULL;
+	struct mm_struct *mm = NULL;
 	unsigned long __user *uoffsets;
 	u64 __user *ucookies;
 	unsigned long size;
 	u32 flags, cnt, i;
-	struct path path;
+	struct path path = {};
+	bool aprobes;
 	pid_t pid;
 	int err;
 
@@ -3287,7 +3306,15 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		return -EINVAL;
 
 	flags = attr->link_create.uprobe_multi.flags;
-	if (flags & ~(BPF_F_UPROBE_MULTI_RETURN | BPF_F_UPROBE_MULTI_PATH_FD))
+	if (flags & ~(BPF_F_UPROBE_MULTI_RETURN | BPF_F_UPROBE_MULTI_PATH_FD |
+		      BPF_F_UPROBE_MULTI_APROBE))
+		return -EINVAL;
+	aprobes = flags & BPF_F_UPROBE_MULTI_APROBE;
+	if (aprobes && (flags != BPF_F_UPROBE_MULTI_APROBE ||
+			attr->link_create.uprobe_multi.ref_ctr_offsets ||
+			attr->link_create.uprobe_multi.path ||
+			attr->link_create.uprobe_multi.path_fd ||
+			is_uprobe_session(prog)))
 		return -EINVAL;
 
 	/*
@@ -3302,6 +3329,8 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		return -EINVAL;
 	if (cnt > MAX_UPROBE_MULTI_CNT)
 		return -E2BIG;
+	if (aprobes && (!pid || cnt > 64))
+		return -EINVAL;
 
 	uref_ctr_offsets = u64_to_user_ptr(attr->link_create.uprobe_multi.ref_ctr_offsets);
 	ucookies = u64_to_user_ptr(attr->link_create.uprobe_multi.cookies);
@@ -3316,13 +3345,14 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	    !access_ok(ucookies, size))
 		return -EFAULT;
 
-	err = bpf_uprobe_multi_get_path(attr, &path);
-	if (err)
-		return err;
-
-	if (!d_is_reg(path.dentry)) {
-		err = -EBADF;
-		goto error_path_put;
+	if (!aprobes) {
+		err = bpf_uprobe_multi_get_path(attr, &path);
+		if (err)
+			return err;
+		if (!d_is_reg(path.dentry)) {
+			err = -EBADF;
+			goto error_path_put;
+		}
 	}
 
 	if (pid) {
@@ -3332,6 +3362,14 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		if (!task) {
 			err = -ESRCH;
 			goto error_path_put;
+		}
+	}
+	if (aprobes) {
+		mm = mm_access(task, PTRACE_MODE_ATTACH_REALCREDS);
+		if (IS_ERR_OR_NULL(mm)) {
+			err = mm ? PTR_ERR(mm) : -ESRCH;
+			mm = NULL;
+			goto error_free;
 		}
 	}
 
@@ -3377,13 +3415,20 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	link->uprobes = uprobes;
 	link->path = path;
 	link->task = task;
+	link->mm = mm;
+	if (mm)
+		mmgrab(mm);
 	link->link.flags = flags;
 
 	bpf_link_init(&link->link, BPF_LINK_TYPE_UPROBE_MULTI,
 		      &bpf_uprobe_multi_link_lops, prog, attr->link_create.attach_type);
 
 	for (i = 0; i < cnt; i++) {
-		uprobes[i].uprobe = uprobe_register(d_real_inode(link->path.dentry),
+		if (aprobes)
+			uprobes[i].uprobe = aprobe_register(mm, uprobes[i].offset,
+							 &uprobes[i].consumer);
+		else
+			uprobes[i].uprobe = uprobe_register(d_real_inode(link->path.dentry),
 						    uprobes[i].offset,
 						    uprobes[i].ref_ctr_offset,
 						    &uprobes[i].consumer);
@@ -3398,6 +3443,8 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	if (err)
 		goto error_unregister;
 
+	if (mm)
+		mmput(mm);
 	return bpf_link_settle(&link_primer);
 
 error_unregister:
@@ -3405,11 +3452,16 @@ error_unregister:
 
 error_free:
 	kvfree(uprobes);
+	if (link && link->mm)
+		mmdrop(link->mm);
 	kfree(link);
 	if (task)
 		put_task_struct(task);
+	if (mm)
+		mmput(mm);
 error_path_put:
-	path_put(&path);
+	if (path.dentry)
+		path_put(&path);
 	return err;
 }
 #else /* !CONFIG_UPROBES */

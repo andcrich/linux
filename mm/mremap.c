@@ -26,6 +26,7 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/mempolicy.h>
 #include <linux/pgalloc.h>
+#include <linux/uprobes.h>
 
 #include <asm/cacheflush.h>
 #include <asm/tlb.h>
@@ -1427,6 +1428,11 @@ static unsigned long move_vma(struct vma_remap_struct *vrm)
 
 	/* We don't want racing faults. */
 	vma_start_write(vrm->vma);
+
+	/* Do not move an address-bound anonymous breakpoint to another address. */
+	err = aprobe_disarm(vrm->vma, vrm->addr, vrm->addr + vrm->old_len);
+	if (err)
+		return err;
 
 	/* Perform copy step. */
 	err = copy_vma_and_data(vrm, &new_vma);

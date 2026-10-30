@@ -205,6 +205,11 @@ extern int uprobe_write(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
 			uprobe_opcode_t *insn, int nbytes, uprobe_write_verify_t verify, bool is_register, bool do_update_ref_ctr,
 			void *data);
 extern struct uprobe *uprobe_register(struct inode *inode, loff_t offset, loff_t ref_ctr_offset, struct uprobe_consumer *uc);
+extern struct uprobe *aprobe_register(struct mm_struct *mm, unsigned long address,
+				     struct uprobe_consumer *uc);
+extern int aprobe_dup_mmap(struct mm_struct *oldmm, struct mm_struct *newmm);
+extern void aprobe_munmap(struct vm_area_struct *vma, unsigned long start, unsigned long end);
+extern int aprobe_disarm(struct vm_area_struct *vma, unsigned long start, unsigned long end);
 extern int uprobe_apply(struct uprobe *uprobe, struct uprobe_consumer *uc, bool);
 extern void uprobe_unregister_nosync(struct uprobe *uprobe, struct uprobe_consumer *uc);
 extern void uprobe_unregister_sync(void);
@@ -283,6 +288,19 @@ static inline void uprobe_end_dup_mmap(void)
 static inline void
 uprobe_dup_mmap(struct mm_struct *oldmm, struct mm_struct *newmm)
 {
+}
+static inline int aprobe_dup_mmap(struct mm_struct *oldmm, struct mm_struct *newmm)
+{
+	return 0;
+}
+static inline void aprobe_munmap(struct vm_area_struct *vma,
+				 unsigned long start, unsigned long end)
+{
+}
+static inline int aprobe_disarm(struct vm_area_struct *vma,
+				unsigned long start, unsigned long end)
+{
+	return 0;
 }
 static inline void uprobe_notify_resume(struct pt_regs *regs)
 {
