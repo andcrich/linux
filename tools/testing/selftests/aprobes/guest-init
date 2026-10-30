@@ -8,6 +8,14 @@ echo APROBES_GUEST_KERNEL
 /bin/busybox uname -a
 /aprobes-test
 result=$?
+if [ "$result" -eq 0 ]; then
+    /hotspot-loader
+    result=$?
+    if [ "$result" -eq 0 ]; then
+        /hotspot-loader zgc
+        result=$?
+    fi
+fi
 echo APROBES_GUEST_TEST_EXIT=$result
 /bin/busybox dmesg | /bin/busybox grep -E 'BUG:|WARNING:|Oops:|kernel BUG|KASAN:'
 /bin/busybox sync

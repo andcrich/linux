@@ -1606,7 +1606,7 @@ struct uprobe *uprobe_register(struct inode *inode,
 EXPORT_SYMBOL_GPL(uprobe_register);
 
 /* Callers must coordinate code mutation while these entry probes are armed. */
-struct uprobe *aprobe_register(struct mm_struct *mm, unsigned long address,
+struct uprobe *aprobe_register_nosync(struct mm_struct *mm, unsigned long address,
 			       struct uprobe_consumer *uc)
 {
 	struct vm_area_struct *vma;
@@ -1643,12 +1643,47 @@ struct uprobe *aprobe_register(struct mm_struct *mm, unsigned long address,
 
 	if (ret) {
 		uprobe_unregister_nosync(uprobe, uc);
-		uprobe_unregister_sync();
 		return ERR_PTR(ret);
 	}
 	return uprobe;
 }
+EXPORT_SYMBOL_GPL(aprobe_register_nosync);
+
+struct uprobe *aprobe_register(struct mm_struct *mm, unsigned long address,
+			     struct uprobe_consumer *uc)
+{
+	struct uprobe *uprobe = aprobe_register_nosync(mm, address, uc);
+
+	if (IS_ERR(uprobe))
+		uprobe_unregister_sync();
+	return uprobe;
+}
 EXPORT_SYMBOL_GPL(aprobe_register);
+
+/* Byte restoration is synchronous; reclamation never waits for this callback. */
+int aprobe_disarm_one(struct uprobe *uprobe)
+{
+	struct mm_struct *mm = uprobe->mm;
+	struct vm_area_struct *vma;
+	int ret = 0;
+
+	if (!mm || mm != current->mm)
+		return -EXDEV;
+	down_write(&uprobe->register_rwsem);
+	mmap_write_lock(mm);
+	if (!test_bit(UPROBE_APROBE_RETIRED, &uprobe->flags)) {
+		vma = vma_lookup(mm, uprobe->offset);
+		if (vma && !vma->vm_file && aprobe_matches_vma(uprobe, vma) &&
+		    test_bit(UPROBE_COPY_INSN, &uprobe->flags))
+			ret = remove_breakpoint(uprobe, vma, uprobe->offset);
+		if (!ret)
+			aprobe_retire(uprobe);
+	}
+	mmap_write_unlock(mm);
+	up_write(&uprobe->register_rwsem);
+	return ret;
+}
+
 
 /**
  * uprobe_apply - add or remove the breakpoints according to @uc->filter

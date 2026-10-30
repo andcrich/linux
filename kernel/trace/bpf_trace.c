@@ -24,6 +24,7 @@
 #include <linux/key.h>
 #include <linux/namei.h>
 #include <linux/file.h>
+#include <linux/rcupdate_trace.h>
 
 #include <net/bpf_sk_storage.h>
 
@@ -2971,6 +2972,9 @@ struct bpf_uprobe {
 	struct uprobe *uprobe;
 	struct uprobe_consumer consumer;
 	bool session;
+	bool dynamic;
+	struct list_head dynamic_node;
+	struct rcu_head dynamic_rcu;
 };
 
 struct bpf_uprobe_multi_link {
@@ -2980,6 +2984,9 @@ struct bpf_uprobe_multi_link {
 	struct bpf_uprobe *uprobes;
 	struct task_struct *task;
 	struct mm_struct *mm;
+	struct mutex aprobe_lock;
+	struct list_head aprobes;
+	u32 aprobe_count;
 };
 
 struct bpf_uprobe_multi_run_ctx {
@@ -2999,12 +3006,27 @@ static void bpf_uprobe_unregister(struct bpf_uprobe *uprobes, u32 cnt)
 		uprobe_unregister_sync();
 }
 
+static void bpf_aprobe_children_release(struct bpf_uprobe_multi_link *link)
+{
+	/* Native callbacks are now gone, so no new children can be created. */
+	while (!list_empty(&link->aprobes)) {
+		struct bpf_uprobe *uprobe;
+
+		uprobe = list_first_entry(&link->aprobes, struct bpf_uprobe,
+					 dynamic_node);
+		list_del(&uprobe->dynamic_node);
+		bpf_uprobe_unregister(uprobe, 1);
+		kfree(uprobe);
+	}
+}
+
 static void bpf_uprobe_multi_link_release(struct bpf_link *link)
 {
 	struct bpf_uprobe_multi_link *umulti_link;
 
 	umulti_link = container_of(link, struct bpf_uprobe_multi_link, link);
 	bpf_uprobe_unregister(umulti_link->uprobes, umulti_link->cnt);
+	bpf_aprobe_children_release(umulti_link);
 	if (umulti_link->task)
 		put_task_struct(umulti_link->task);
 	if (umulti_link->mm)
@@ -3047,7 +3069,7 @@ static int bpf_uprobe_multi_link_fill_link_info(const struct bpf_link *link,
 	info->uprobe_multi.flags = umulti_link->link.flags;
 	info->uprobe_multi.pid = umulti_link->task ?
 				 task_pid_nr_ns(umulti_link->task, task_active_pid_ns(current)) : 0;
-	if (umulti_link->mm) {
+	if (umulti_link->mm && !umulti_link->path.dentry) {
 		if (upath || upath_size)
 			return -EINVAL;
 		info->uprobe_multi.path_size = 0;
@@ -3105,7 +3127,7 @@ static void bpf_uprobe_multi_show_fdinfo(const struct bpf_link *link,
 	pid_t pid;
 
 	umulti_link = container_of(link, struct bpf_uprobe_multi_link, link);
-	if (umulti_link->mm) {
+	if (umulti_link->mm && !umulti_link->path.dentry) {
 		seq_printf(seq, "aprobe_cnt:\t%u\npid:\t%u\n",
 			   umulti_link->cnt, task_tgid_nr(umulti_link->task));
 		return;
@@ -3228,6 +3250,122 @@ uprobe_multi_link_ret_handler(struct uprobe_consumer *con, unsigned long func, s
 	return 0;
 }
 
+static struct bpf_uprobe_multi_link *aprobe_factory_context(void)
+{
+	struct bpf_uprobe_multi_run_ctx *ctx;
+	struct bpf_uprobe_multi_link *link;
+
+	ctx = container_of(current->bpf_ctx, struct bpf_uprobe_multi_run_ctx,
+			   session_ctx.run_ctx);
+	link = ctx->uprobe->link;
+	if (ctx->uprobe->dynamic ||
+	    !(link->link.flags & BPF_F_UPROBE_MULTI_APROBE_FACTORY) ||
+	    link->mm != current->mm)
+		return NULL;
+	return link;
+}
+
+static void aprobe_consumer_free(struct rcu_head *rcu)
+{
+	struct bpf_uprobe *uprobe = container_of(rcu, struct bpf_uprobe, dynamic_rcu);
+
+	kfree(uprobe);
+}
+
+__bpf_kfunc_start_defs();
+
+/* The child executes the parent's program with its own attach cookie. */
+__bpf_kfunc int bpf_aprobe_attach(u64 address, u64 cookie)
+{
+	struct bpf_uprobe_multi_link *link = aprobe_factory_context();
+	struct bpf_uprobe *uprobe, *existing;
+	int ret = 0;
+
+	if (!link)
+		return -EPERM;
+	mutex_lock(&link->aprobe_lock);
+	list_for_each_entry(existing, &link->aprobes, dynamic_node) {
+		if (existing->offset == address) {
+			ret = existing->cookie == cookie ? 0 : -EEXIST;
+			goto out;
+		}
+	}
+	if (link->aprobe_count >= 256) {
+		ret = -E2BIG;
+		goto out;
+	}
+	uprobe = kzalloc_obj(*uprobe);
+	if (!uprobe) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	uprobe->link = link;
+	uprobe->offset = address;
+	uprobe->cookie = cookie;
+	uprobe->dynamic = true;
+	uprobe->consumer.handler = uprobe_multi_link_handler;
+	uprobe->consumer.filter = uprobe_multi_link_filter;
+	uprobe->uprobe = aprobe_register_nosync(link->mm, address, &uprobe->consumer);
+	if (IS_ERR(uprobe->uprobe)) {
+		ret = PTR_ERR(uprobe->uprobe);
+		call_rcu_tasks_trace(&uprobe->dynamic_rcu, aprobe_consumer_free);
+		goto out;
+	}
+	list_add_tail(&uprobe->dynamic_node, &link->aprobes);
+	link->aprobe_count++;
+out:
+	mutex_unlock(&link->aprobe_lock);
+	return ret;
+}
+
+/* Restore before returning to the JVM; no synchronize_* from the callback. */
+__bpf_kfunc int bpf_aprobe_detach(u64 address, u64 length)
+{
+	struct bpf_uprobe_multi_link *link = aprobe_factory_context();
+	struct bpf_uprobe *uprobe, *next;
+	int ret = 0, count = 0;
+
+	if (!link)
+		return -EPERM;
+	if (!length || address + length < address)
+		return -EINVAL;
+	mutex_lock(&link->aprobe_lock);
+	list_for_each_entry_safe(uprobe, next, &link->aprobes, dynamic_node) {
+		if (uprobe->offset < address || uprobe->offset - address >= length)
+			continue;
+		ret = aprobe_disarm_one(uprobe->uprobe);
+		if (ret)
+			break;
+		uprobe_unregister_nosync(uprobe->uprobe, &uprobe->consumer);
+		list_del(&uprobe->dynamic_node);
+		link->aprobe_count--;
+		call_rcu_tasks_trace(&uprobe->dynamic_rcu, aprobe_consumer_free);
+		count++;
+	}
+	mutex_unlock(&link->aprobe_lock);
+	return ret ? ret : count;
+}
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(aprobe_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_aprobe_attach, KF_SLEEPABLE)
+BTF_ID_FLAGS(func, bpf_aprobe_detach, KF_SLEEPABLE)
+BTF_KFUNCS_END(aprobe_kfunc_ids)
+
+static int aprobe_kfunc_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+	if (!btf_id_set8_contains(&aprobe_kfunc_ids, kfunc_id))
+		return 0;
+	return is_uprobe_multi(prog) && !is_uprobe_session(prog) ? 0 : -EACCES;
+}
+
+static const struct btf_kfunc_id_set aprobe_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set = &aprobe_kfunc_ids,
+	.filter = aprobe_kfunc_filter,
+};
+
 static u64 bpf_uprobe_multi_entry_ip(struct bpf_run_ctx *ctx)
 {
 	struct bpf_uprobe_multi_run_ctx *run_ctx;
@@ -3291,7 +3429,7 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 	unsigned long size;
 	u32 flags, cnt, i;
 	struct path path = {};
-	bool aprobes;
+	bool aprobes, factory;
 	pid_t pid;
 	int err;
 
@@ -3307,9 +3445,13 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 
 	flags = attr->link_create.uprobe_multi.flags;
 	if (flags & ~(BPF_F_UPROBE_MULTI_RETURN | BPF_F_UPROBE_MULTI_PATH_FD |
-		      BPF_F_UPROBE_MULTI_APROBE))
+		      BPF_F_UPROBE_MULTI_APROBE | BPF_F_UPROBE_MULTI_APROBE_FACTORY))
 		return -EINVAL;
 	aprobes = flags & BPF_F_UPROBE_MULTI_APROBE;
+	factory = flags & BPF_F_UPROBE_MULTI_APROBE_FACTORY;
+	if (factory && (aprobes || flags & BPF_F_UPROBE_MULTI_RETURN ||
+			is_uprobe_session(prog) || !prog->sleepable))
+		return -EINVAL;
 	if (aprobes && (flags != BPF_F_UPROBE_MULTI_APROBE ||
 			attr->link_create.uprobe_multi.ref_ctr_offsets ||
 			attr->link_create.uprobe_multi.path ||
@@ -3329,7 +3471,7 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 		return -EINVAL;
 	if (cnt > MAX_UPROBE_MULTI_CNT)
 		return -E2BIG;
-	if (aprobes && (!pid || cnt > 64))
+	if ((aprobes && (!pid || cnt > 64)) || (factory && !pid))
 		return -EINVAL;
 
 	uref_ctr_offsets = u64_to_user_ptr(attr->link_create.uprobe_multi.ref_ctr_offsets);
@@ -3364,7 +3506,7 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 			goto error_path_put;
 		}
 	}
-	if (aprobes) {
+	if (aprobes || factory) {
 		mm = mm_access(task, PTRACE_MODE_ATTACH_REALCREDS);
 		if (IS_ERR_OR_NULL(mm)) {
 			err = mm ? PTR_ERR(mm) : -ESRCH;
@@ -3411,6 +3553,8 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 			uprobes[i].consumer.filter = uprobe_multi_link_filter;
 	}
 
+	mutex_init(&link->aprobe_lock);
+	INIT_LIST_HEAD(&link->aprobes);
 	link->cnt = cnt;
 	link->uprobes = uprobes;
 	link->path = path;
@@ -3449,6 +3593,7 @@ int bpf_uprobe_multi_link_attach(const union bpf_attr *attr, struct bpf_prog *pr
 
 error_unregister:
 	bpf_uprobe_unregister(uprobes, link->cnt);
+	bpf_aprobe_children_release(link);
 
 error_free:
 	kvfree(uprobes);
@@ -3525,6 +3670,9 @@ static int __init bpf_trace_kfuncs_init(void)
 {
 	int err = 0;
 
+#ifdef CONFIG_UPROBES
+	err = err ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_KPROBE, &aprobe_kfunc_set);
+#endif
 	err = err ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_KPROBE, &bpf_session_kfunc_set);
 	err = err ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &bpf_session_kfunc_set);
 

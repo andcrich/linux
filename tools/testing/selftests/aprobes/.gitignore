@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright 2026 Isovalent, Inc.
+*.class
+*.so
+*.o
+*.log
+/aprobes-test
+/hotspot-loader
+/hotspot-layout.h
+/hotspot-symbols.h
+/initramfs/
+/initramfs.cpio.gz
+/jdk-version.txt
+/qemu.pid

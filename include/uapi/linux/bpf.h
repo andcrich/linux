@@ -1375,6 +1375,8 @@ enum {
 	BPF_F_UPROBE_MULTI_PATH_FD    = (1U << 1),
 	/* Experimental: offsets are virtual addresses in the specified process. */
 	BPF_F_UPROBE_MULTI_APROBE     = (1U << 2),
+	/* Experimental: a native uprobe link may own dynamic address probes. */
+	BPF_F_UPROBE_MULTI_APROBE_FACTORY = (1U << 3),
 };
 
 /* link_create.netfilter.flags used in LINK_CREATE command for
