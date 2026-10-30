@@ -1077,6 +1077,8 @@ static void mm_init_uprobes_state(struct mm_struct *mm)
 {
 #ifdef CONFIG_UPROBES
 	mm->uprobes_state.xol_area = NULL;
+	mm->uprobes_state.aprobes = RB_ROOT;
+	atomic_set(&mm->uprobes_state.aprobe_allocated, 0);
 #endif
 }
 

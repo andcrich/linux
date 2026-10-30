@@ -92,6 +92,7 @@ interactions.
 
    user_events
    uprobetracer
+   aprobes
 
 Remote Tracing
 --------------

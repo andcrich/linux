@@ -35,6 +35,7 @@
 
 #define UINSNS_PER_PAGE			(PAGE_SIZE/UPROBE_XOL_SLOT_BYTES)
 #define MAX_UPROBE_XOL_SLOTS		UINSNS_PER_PAGE
+#define MAX_APROBES_PER_MM		4096
 
 static struct rb_root uprobes_tree = RB_ROOT;
 /*
@@ -58,6 +59,8 @@ DEFINE_STATIC_SRCU_FAST_UPDOWN(uretprobes_srcu);
 
 /* Have a copy of original instruction */
 #define UPROBE_COPY_INSN	0
+#define UPROBE_APROBE_RETIRED	1
+#define UPROBE_APROBE_ORPHANED	2
 
 struct uprobe {
 	struct rb_node		rb_node;	/* node in the rb tree */
@@ -67,6 +70,8 @@ struct uprobe {
 	struct list_head	pending_list;
 	struct list_head	consumers;
 	struct inode		*inode;		/* Also hold a ref to inode */
+	struct mm_struct	*mm;		/* Aprobes hold mm_count, not mm_users. */
+	struct anon_vma		*anon_vma;	/* Anonymous mapping identity. */
 	union {
 		struct rcu_head		rcu;
 		struct work_struct	work;
@@ -86,6 +91,11 @@ struct uprobe {
 	 *		line, copied to xol_area by xol_get_insn_slot().
 	 */
 	struct arch_uprobe	arch;
+};
+
+struct aprobe {
+	struct uprobe uprobe;
+	struct work_struct free_work;
 };
 
 struct delayed_uprobe {
@@ -446,7 +456,8 @@ static int __uprobe_write(struct vm_area_struct *vma,
 	 * ... and the mapped page is identical to the original page that
 	 * would get faulted in on next access.
 	 */
-	if (!orig_page_is_identical(vma, vaddr, fw->page, &pmd_mappable))
+	if (!vma->vm_file ||
+	    !orig_page_is_identical(vma, vaddr, fw->page, &pmd_mappable))
 		goto remap;
 
 	dec_mm_counter(vma->vm_mm, MM_ANONPAGES);
@@ -658,11 +669,37 @@ static inline bool uprobe_is_active(struct uprobe *uprobe)
 	return !RB_EMPTY_NODE(&uprobe->rb_node);
 }
 
+static struct rb_root *uprobe_tree(struct uprobe *uprobe)
+{
+	return uprobe->mm ? &uprobe->mm->uprobes_state.aprobes : &uprobes_tree;
+}
+
+static void aprobe_free_deferred(struct work_struct *work)
+{
+	struct aprobe *aprobe = container_of(work, struct aprobe, free_work);
+	struct uprobe *uprobe = &aprobe->uprobe;
+	struct mm_struct *mm = uprobe->mm;
+
+	if (uprobe->anon_vma)
+		put_anon_vma(uprobe->anon_vma);
+	atomic_dec(&mm->uprobes_state.aprobe_allocated);
+	mmdrop(mm);
+	kfree(aprobe);
+}
+
 static void uprobe_free_rcu_tasks_trace(struct rcu_head *rcu)
 {
 	struct uprobe *uprobe = container_of(rcu, struct uprobe, rcu);
 
-	kfree(uprobe);
+	if (uprobe->mm) {
+		struct aprobe *aprobe = container_of(uprobe, struct aprobe, uprobe);
+
+		/* Dropping the last mm reference requires process context. */
+		INIT_WORK(&aprobe->free_work, aprobe_free_deferred);
+		schedule_work(&aprobe->free_work);
+	} else {
+		kfree(uprobe);
+	}
 }
 
 static void uprobe_free_srcu(struct rcu_head *rcu)
@@ -680,7 +717,8 @@ static void uprobe_free_deferred(struct work_struct *work)
 
 	if (uprobe_is_active(uprobe)) {
 		write_seqcount_begin(&uprobes_seqcount);
-		rb_erase(&uprobe->rb_node, &uprobes_tree);
+		rb_erase(&uprobe->rb_node, uprobe_tree(uprobe));
+		RB_CLEAR_NODE(&uprobe->rb_node);
 		write_seqcount_end(&uprobes_seqcount);
 	}
 
@@ -859,13 +897,16 @@ static struct uprobe *hprobe_expire(struct hprobe *hprobe, bool get)
 }
 
 static __always_inline
-int uprobe_cmp(const struct inode *l_inode, const loff_t l_offset,
+int uprobe_cmp(const void *l_object, const loff_t l_offset,
 	       const struct uprobe *r)
 {
-	if (l_inode < r->inode)
+	unsigned long left = (unsigned long)l_object;
+	unsigned long right = (unsigned long)(r->mm ? (void *)r->mm : r->inode);
+
+	if (left < right)
 		return -1;
 
-	if (l_inode > r->inode)
+	if (left > right)
 		return 1;
 
 	if (l_offset < r->offset)
@@ -881,30 +922,32 @@ int uprobe_cmp(const struct inode *l_inode, const loff_t l_offset,
 	rb_entry((node), struct uprobe, rb_node)
 
 struct __uprobe_key {
-	struct inode *inode;
+	const void *object;
 	loff_t offset;
 };
 
 static inline int __uprobe_cmp_key(const void *key, const struct rb_node *b)
 {
 	const struct __uprobe_key *a = key;
-	return uprobe_cmp(a->inode, a->offset, __node_2_uprobe(b));
+	return uprobe_cmp(a->object, a->offset, __node_2_uprobe(b));
 }
 
 static inline int __uprobe_cmp(struct rb_node *a, const struct rb_node *b)
 {
 	struct uprobe *u = __node_2_uprobe(a);
-	return uprobe_cmp(u->inode, u->offset, __node_2_uprobe(b));
+	return uprobe_cmp(u->mm ? (void *)u->mm : u->inode,
+			  u->offset, __node_2_uprobe(b));
 }
 
 /*
  * Assumes being inside RCU protected region.
  * No refcount is taken on returned uprobe.
  */
-static struct uprobe *find_uprobe_rcu(struct inode *inode, loff_t offset)
+static struct uprobe *find_uprobe_tree_rcu(struct rb_root *root,
+					 const void *object, loff_t offset)
 {
 	struct __uprobe_key key = {
-		.inode = inode,
+		.object = object,
 		.offset = offset,
 	};
 	struct rb_node *node;
@@ -914,7 +957,7 @@ static struct uprobe *find_uprobe_rcu(struct inode *inode, loff_t offset)
 
 	do {
 		seq = read_seqcount_begin(&uprobes_seqcount);
-		node = rb_find_rcu(&key, &uprobes_tree, __uprobe_cmp_key);
+		node = rb_find_rcu(&key, root, __uprobe_cmp_key);
 		/*
 		 * Lockless RB-tree lookups can result only in false negatives.
 		 * If the element is found, it is correct and can be returned
@@ -928,6 +971,53 @@ static struct uprobe *find_uprobe_rcu(struct inode *inode, loff_t offset)
 	} while (read_seqcount_retry(&uprobes_seqcount, seq));
 
 	return NULL;
+}
+
+static struct uprobe *find_uprobe_rcu(struct inode *inode, loff_t offset)
+{
+	return find_uprobe_tree_rcu(&uprobes_tree, inode, offset);
+}
+
+/* Find the first live address probe in a range, including its reference. */
+static struct uprobe *aprobe_first(struct mm_struct *mm, unsigned long start,
+				 unsigned long end)
+{
+	struct rb_node *node, *first = NULL;
+	struct uprobe *uprobe, *found = NULL;
+
+	read_lock(&uprobes_treelock);
+	node = mm->uprobes_state.aprobes.rb_node;
+	while (node) {
+		uprobe = __node_2_uprobe(node);
+		if (uprobe->offset >= start) {
+			first = node;
+			node = node->rb_left;
+		} else {
+			node = node->rb_right;
+		}
+	}
+	for (node = first; node; node = rb_next(node)) {
+		uprobe = __node_2_uprobe(node);
+		if (uprobe->offset >= end)
+			break;
+		if (try_get_uprobe(uprobe)) {
+			found = uprobe;
+			break;
+		}
+	}
+	read_unlock(&uprobes_treelock);
+	return found;
+}
+
+/* Caller serializes mapping changes with mmap_lock or the VMA read locks. */
+bool aprobe_range_active(struct mm_struct *mm, unsigned long start, unsigned long end)
+{
+	struct uprobe *uprobe = aprobe_first(mm, start, end);
+
+	if (!uprobe)
+		return false;
+	put_uprobe(uprobe);
+	return true;
 }
 
 /*
@@ -949,12 +1039,12 @@ static struct uprobe *__insert_uprobe(struct uprobe *uprobe)
 {
 	struct rb_node *node;
 again:
-	node = rb_find_add_rcu(&uprobe->rb_node, &uprobes_tree, __uprobe_cmp);
+	node = rb_find_add_rcu(&uprobe->rb_node, uprobe_tree(uprobe), __uprobe_cmp);
 	if (node) {
 		struct uprobe *u = __node_2_uprobe(node);
 
 		if (!try_get_uprobe(u)) {
-			rb_erase(node, &uprobes_tree);
+			rb_erase(node, uprobe_tree(uprobe));
 			RB_CLEAR_NODE(&u->rb_node);
 			goto again;
 		}
@@ -992,16 +1082,43 @@ ref_ctr_mismatch_warn(struct uprobe *cur_uprobe, struct uprobe *uprobe)
 		(unsigned long long) uprobe->ref_ctr_offset);
 }
 
-static struct uprobe *alloc_uprobe(struct inode *inode, loff_t offset,
+static struct uprobe *alloc_uprobe(struct inode *inode, struct mm_struct *mm,
+				   loff_t offset,
 				   loff_t ref_ctr_offset)
 {
 	struct uprobe *uprobe, *cur_uprobe;
 
-	uprobe = kzalloc_obj(struct uprobe);
-	if (!uprobe)
+	if (mm) {
+		struct __uprobe_key key = { .object = mm, .offset = offset };
+		struct rb_node *node;
+
+		read_lock(&uprobes_treelock);
+		node = rb_find(&key, &mm->uprobes_state.aprobes, __uprobe_cmp_key);
+		cur_uprobe = node ? try_get_uprobe(__node_2_uprobe(node)) : NULL;
+		read_unlock(&uprobes_treelock);
+		if (cur_uprobe)
+			return cur_uprobe;
+		if (atomic_inc_return(&mm->uprobes_state.aprobe_allocated) >
+		    MAX_APROBES_PER_MM) {
+			atomic_dec(&mm->uprobes_state.aprobe_allocated);
+			return ERR_PTR(-E2BIG);
+		}
+	}
+	if (mm) {
+		struct aprobe *aprobe = kzalloc_obj(*aprobe, GFP_KERNEL_ACCOUNT);
+
+		uprobe = aprobe ? &aprobe->uprobe : NULL;
+	} else {
+		uprobe = kzalloc_obj(*uprobe);
+	}
+	if (!uprobe) {
+		if (mm)
+			atomic_dec(&mm->uprobes_state.aprobe_allocated);
 		return ERR_PTR(-ENOMEM);
+	}
 
 	uprobe->inode = inode;
+	uprobe->mm = mm;
 	uprobe->offset = offset;
 	uprobe->ref_ctr_offset = ref_ctr_offset;
 	INIT_LIST_HEAD(&uprobe->consumers);
@@ -1009,11 +1126,17 @@ static struct uprobe *alloc_uprobe(struct inode *inode, loff_t offset,
 	init_rwsem(&uprobe->consumer_rwsem);
 	RB_CLEAR_NODE(&uprobe->rb_node);
 	refcount_set(&uprobe->ref, 1);
+	if (mm)
+		mmgrab(mm);
 
-	/* add to uprobes_tree, sorted on inode:offset */
+	/* File probes use inode/offset; address probes use mm/address. */
 	cur_uprobe = insert_uprobe(uprobe);
-	/* a uprobe exists for this inode:offset combination */
+	/* Another registration already owns this site. */
 	if (cur_uprobe != uprobe) {
+		if (mm) {
+			atomic_dec(&mm->uprobes_state.aprobe_allocated);
+			mmdrop(mm);
+		}
 		if (cur_uprobe->ref_ctr_offset != uprobe->ref_ctr_offset) {
 			ref_ctr_mismatch_warn(cur_uprobe, uprobe);
 			put_uprobe(cur_uprobe);
@@ -1109,7 +1232,21 @@ static int prepare_uprobe(struct uprobe *uprobe, struct file *file,
 	if (test_bit(UPROBE_COPY_INSN, &uprobe->flags))
 		goto out;
 
-	ret = copy_insn(uprobe, file);
+	if (uprobe->mm) {
+		struct page *page;
+
+		ret = get_user_pages_remote(mm, vaddr, 1, FOLL_FORCE, &page, NULL);
+		if (ret == 1) {
+			uprobe_copy_from_page(page, vaddr, &uprobe->arch.insn,
+					      sizeof(uprobe->arch.insn));
+			put_page(page);
+			ret = 0;
+		} else if (!ret) {
+			ret = -EFAULT;
+		}
+	} else {
+		ret = copy_insn(uprobe, file);
+	}
 	if (ret)
 		goto out;
 
@@ -1186,6 +1323,115 @@ static int remove_breakpoint(struct uprobe *uprobe, struct vm_area_struct *vma,
 
 	mm_flags_set(MMF_RECALC_UPROBES, mm);
 	return set_orig_insn(&uprobe->arch, vma, vaddr);
+}
+
+static bool valid_aprobe_vma(struct vm_area_struct *vma)
+{
+	return vma_is_anonymous(vma) && vma->anon_vma && !vma->vm_file &&
+		(vma->vm_flags & (VM_EXEC | VM_MAYSHARE | VM_HUGETLB)) == VM_EXEC;
+}
+
+static bool aprobe_matches_vma(struct uprobe *uprobe, struct vm_area_struct *vma)
+{
+	struct anon_vma *anon_vma = READ_ONCE(vma->anon_vma);
+
+	return anon_vma && READ_ONCE(anon_vma->root) == uprobe->anon_vma;
+}
+
+static void aprobe_retire(struct uprobe *uprobe)
+{
+	write_lock(&uprobes_treelock);
+	write_seqcount_begin(&uprobes_seqcount);
+	if (uprobe_is_active(uprobe)) {
+		rb_erase(&uprobe->rb_node, &uprobe->mm->uprobes_state.aprobes);
+		RB_CLEAR_NODE(&uprobe->rb_node);
+	}
+	set_bit(UPROBE_APROBE_RETIRED, &uprobe->flags);
+	write_seqcount_end(&uprobes_seqcount);
+	write_unlock(&uprobes_treelock);
+
+	/* A failed last detach retained one reference for trap emulation. */
+	if (test_and_clear_bit(UPROBE_APROBE_ORPHANED, &uprobe->flags))
+		put_uprobe(uprobe);
+}
+
+/* With a VMA, mmap_lock is held for write to restore before retirement. */
+static int aprobe_retire_range(struct mm_struct *mm, struct vm_area_struct *vma,
+				unsigned long start, unsigned long end)
+{
+	struct uprobe *uprobe;
+
+	if (RB_EMPTY_ROOT(&mm->uprobes_state.aprobes))
+		return 0;
+
+	while ((uprobe = aprobe_first(mm, start, end))) {
+		int ret = 0;
+
+		start = uprobe->offset + 1;
+		if (vma && atomic_read(&mm->mm_users) &&
+		    test_bit(UPROBE_COPY_INSN, &uprobe->flags) &&
+		    aprobe_matches_vma(uprobe, vma))
+			ret = remove_breakpoint(uprobe, vma, uprobe->offset);
+		/* On failure keep emulation available, scoped to the original anon_vma. */
+		if (!ret)
+			aprobe_retire(uprobe);
+		put_uprobe(uprobe);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/* Called after PTE removal; no saved bytes may be written to this range. */
+void aprobe_munmap(struct vm_area_struct *vma, unsigned long start, unsigned long end)
+{
+	aprobe_retire_range(vma->vm_mm, NULL, start, end);
+}
+
+/*
+ * Retire all registrations affected by an MM operation, not one consumer.
+ * mmap_lock must be held for write before moving PTEs or changing protections.
+ */
+int aprobe_clear_range(struct vm_area_struct *vma, unsigned long start, unsigned long end)
+{
+	return aprobe_retire_range(vma->vm_mm, vma, start, end);
+}
+
+static void aprobe_unregister_nosync(struct uprobe *uprobe,
+				    struct uprobe_consumer *uc)
+{
+	struct mm_struct *mm = uprobe->mm;
+	struct vm_area_struct *vma;
+	bool retain = false;
+	int ret = 0;
+
+	down_write(&uprobe->register_rwsem);
+	consumer_del(uprobe, uc);
+	if (list_empty(&uprobe->consumers) && mmget_not_zero(mm)) {
+		mmap_write_lock(mm);
+		if (!test_bit(UPROBE_APROBE_RETIRED, &uprobe->flags)) {
+			vma = vma_lookup(mm, uprobe->offset);
+			if (vma && !vma->vm_file && aprobe_matches_vma(uprobe, vma) &&
+			    test_bit(UPROBE_COPY_INSN, &uprobe->flags)) {
+				vma_start_write(vma);
+				ret = remove_breakpoint(uprobe, vma, uprobe->offset);
+			}
+			if (!ret) {
+				aprobe_retire(uprobe);
+			} else {
+				/* Keep one reference until the mapping is retired. */
+				retain = !test_and_set_bit(UPROBE_APROBE_ORPHANED,
+							   &uprobe->flags);
+			}
+		}
+		mmap_write_unlock(mm);
+		mmput(mm);
+	}
+	up_write(&uprobe->register_rwsem);
+	if (ret)
+		uprobe_warn(current, "unregister address probe, retaining instruction");
+	if (!retain)
+		put_uprobe(uprobe);
 }
 
 struct map_info {
@@ -1341,6 +1587,11 @@ void uprobe_unregister_nosync(struct uprobe *uprobe, struct uprobe_consumer *uc)
 {
 	int err;
 
+	if (uprobe->mm) {
+		aprobe_unregister_nosync(uprobe, uc);
+		return;
+	}
+
 	down_write(&uprobe->register_rwsem);
 	consumer_del(uprobe, uc);
 	err = register_for_each_vma(uprobe, NULL);
@@ -1418,7 +1669,7 @@ struct uprobe *uprobe_register(struct inode *inode,
 	if (!IS_ALIGNED(ref_ctr_offset, sizeof(short)))
 		return ERR_PTR(-EINVAL);
 
-	uprobe = alloc_uprobe(inode, offset, ref_ctr_offset);
+	uprobe = alloc_uprobe(inode, NULL, offset, ref_ctr_offset);
 	if (IS_ERR(uprobe))
 		return uprobe;
 
@@ -1441,6 +1692,65 @@ struct uprobe *uprobe_register(struct inode *inode,
 	return uprobe;
 }
 EXPORT_SYMBOL_GPL(uprobe_register);
+
+/**
+ * aprobe_register - register an entry consumer at an anonymous address
+ * @mm: target address space, with a live mm_users reference held by the caller
+ * @address: instruction address in a private anonymous executable mapping
+ * @uc: consumer, kept alive until unregister and synchronization complete
+ *
+ * Instruction bytes must remain stable while the site is registered. A mapping
+ * change can retire the registration; a later registration captures new bytes.
+ * Consumers share a breakpoint, and unregister removes only the given consumer.
+ *
+ * Context: May sleep. As with uprobe_register(), error cleanup synchronizes
+ * callbacks and must not be invoked from an active uprobe callback.
+ * Return: a referenced probe, or an ERR_PTR on failure.
+ */
+struct uprobe *aprobe_register(struct mm_struct *mm, unsigned long address,
+			       struct uprobe_consumer *uc)
+{
+	struct vm_area_struct *vma;
+	struct uprobe *uprobe;
+	int ret;
+
+	if (!uc->handler || uc->ret_handler || !address ||
+	    !IS_ALIGNED(address, UPROBE_SWBP_INSN_SIZE) ||
+	    offset_in_page(address) > PAGE_SIZE - sizeof(uprobe->arch.insn))
+		return ERR_PTR(-EINVAL);
+
+	uprobe = alloc_uprobe(NULL, mm, address, 0);
+	if (IS_ERR(uprobe))
+		return uprobe;
+
+	down_write(&uprobe->register_rwsem);
+	consumer_add(uprobe, uc);
+	percpu_down_write(&dup_mmap_sem);
+	mmap_write_lock(mm);
+	vma = vma_lookup(mm, address);
+	ret = -EINVAL;
+	if (vma && valid_aprobe_vma(vma) &&
+	    !test_bit(UPROBE_APROBE_RETIRED, &uprobe->flags)) {
+		vma_start_write(vma);
+		if (!uprobe->anon_vma) {
+			uprobe->anon_vma = vma->anon_vma->root;
+			get_anon_vma(uprobe->anon_vma);
+		}
+		if (aprobe_matches_vma(uprobe, vma))
+			ret = install_breakpoint(uprobe, vma, address);
+	}
+	mmap_write_unlock(mm);
+	percpu_up_write(&dup_mmap_sem);
+	up_write(&uprobe->register_rwsem);
+
+	if (ret) {
+		uprobe_unregister_nosync(uprobe, uc);
+		uprobe_unregister_sync();
+		return ERR_PTR(ret);
+	}
+	return uprobe;
+}
+EXPORT_SYMBOL_GPL(aprobe_register);
 
 /**
  * uprobe_apply - add or remove the breakpoints according to @uc->filter
@@ -1816,6 +2126,8 @@ void uprobe_clear_state(struct mm_struct *mm)
 {
 	struct xol_area *area = mm->uprobes_state.xol_area;
 
+	aprobe_retire_range(mm, NULL, 0, ULONG_MAX);
+
 	mutex_lock(&delayed_uprobe_lock);
 	delayed_uprobe_remove(NULL, mm);
 	mutex_unlock(&delayed_uprobe_lock);
@@ -1845,6 +2157,28 @@ void uprobe_dup_mmap(struct mm_struct *oldmm, struct mm_struct *newmm)
 		/* unconditionally, dup_mmap() skips VM_DONTCOPY vmas */
 		mm_flags_set(MMF_RECALC_UPROBES, newmm);
 	}
+}
+
+/* Called after page-table copying, before the child can execute userspace. */
+int aprobe_dup_mmap(struct mm_struct *oldmm, struct mm_struct *newmm)
+{
+	struct vm_area_struct *vma;
+	struct uprobe *uprobe;
+	unsigned long start = 0;
+	int ret = 0;
+
+	while ((uprobe = aprobe_first(oldmm, start, ULONG_MAX))) {
+		start = uprobe->offset + 1;
+		vma = vma_lookup(newmm, uprobe->offset);
+		if (vma && vma_is_anonymous(vma) && !vma->vm_file &&
+		    test_bit(UPROBE_COPY_INSN, &uprobe->flags) &&
+		    aprobe_matches_vma(uprobe, vma))
+			ret = remove_breakpoint(uprobe, vma, uprobe->offset);
+		put_uprobe(uprobe);
+		if (ret)
+			break;
+	}
+	return ret;
 }
 
 static unsigned long xol_get_slot_nr(struct xol_area *area)
@@ -2377,6 +2711,12 @@ static void mmf_recalc_uprobes(struct mm_struct *mm)
 {
 	VMA_ITERATOR(vmi, mm, 0);
 	struct vm_area_struct *vma;
+	struct uprobe *aprobe = aprobe_first(mm, 0, ULONG_MAX);
+
+	if (aprobe) {
+		put_uprobe(aprobe);
+		return;
+	}
 
 	for_each_vma(vmi, vma) {
 		if (!valid_vma(vma, false))
@@ -2438,6 +2778,14 @@ static struct uprobe *find_active_uprobe_speculative(unsigned long bp_vaddr)
 	vma = vma_lookup(mm, bp_vaddr);
 	if (!vma)
 		return NULL;
+	if (!READ_ONCE(vma->vm_file)) {
+		uprobe = find_uprobe_tree_rcu(&mm->uprobes_state.aprobes, mm, bp_vaddr);
+		if (uprobe && !aprobe_matches_vma(uprobe, vma))
+			uprobe = NULL;
+		if (mmap_lock_speculate_retry(mm, seq))
+			return NULL;
+		return uprobe;
+	}
 
 	/*
 	 * vm_file memory can be reused for another instance of struct file,
@@ -2482,6 +2830,10 @@ static struct uprobe *find_active_uprobe_rcu(unsigned long bp_vaddr, int *is_swb
 			loff_t offset = vaddr_to_offset(vma, bp_vaddr);
 
 			uprobe = find_uprobe_rcu(inode, offset);
+		} else {
+			uprobe = find_uprobe_tree_rcu(&mm->uprobes_state.aprobes, mm, bp_vaddr);
+			if (uprobe && !aprobe_matches_vma(uprobe, vma))
+				uprobe = NULL;
 		}
 
 		if (!uprobe)
@@ -2768,7 +3120,8 @@ static void handle_swbp(struct pt_regs *regs)
 	handler_chain(uprobe, regs);
 
 	/* Try to optimize after first hit. */
-	arch_uprobe_optimize(&uprobe->arch, bp_vaddr);
+	if (!uprobe->mm)
+		arch_uprobe_optimize(&uprobe->arch, bp_vaddr);
 
 	/*
 	 * If user decided to take execution elsewhere, it makes little sense

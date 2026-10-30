@@ -16,7 +16,7 @@ CLANG_CPUV4 := 1
 endif
 
 # Order correspond to 'make run_tests' order
-TEST_GEN_PROGS = test_verifier test_tag test_maps test_lru_map test_progs \
+TEST_GEN_PROGS = test_aprobes test_verifier test_tag test_maps test_lru_map test_progs \
 	test_sockmap \
 	test_tcpnotify_user \
 	test_progs-no_alu32
@@ -698,3 +698,7 @@ libarena: $(LIBARENA_SKEL)
 ifneq ($(CLANG_HAS_ARENA_ASAN),)
 libarena_asan: $(LIBARENA_ASAN_SKEL)
 endif
+
+$(OUTPUT)/test_aprobes: test_aprobes.c ../kselftest.h | $(OUTPUT)
+	$(call msg,BINARY,,$@)
+	$(Q)$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS) -pthread

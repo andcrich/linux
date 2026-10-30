@@ -47,3 +47,4 @@ verification_cert.h
 *.BTF.base
 usdt_1
 usdt_2
+/test_aprobes

@@ -28787,11 +28787,13 @@ M:	Peter Zijlstra <peterz@infradead.org>
 L:	linux-kernel@vger.kernel.org
 L:	linux-trace-kernel@vger.kernel.org
 S:	Maintained
+F:	Documentation/trace/aprobes.rst
 F:	arch/*/include/asm/uprobes.h
 F:	arch/*/kernel/probes/uprobes.c
 F:	arch/*/kernel/uprobes.c
 F:	include/linux/uprobes.h
 F:	kernel/events/uprobes.c
+F:	tools/testing/selftests/bpf/test_aprobes.c
 
 USB "USBNET" DRIVER FRAMEWORK
 M:	Oliver Neukum <oneukum@suse.com>

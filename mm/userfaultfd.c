@@ -11,6 +11,7 @@
  */
 
 #include <linux/mm.h>
+#include <linux/uprobes.h>
 #include <linux/sched/signal.h>
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
@@ -2020,6 +2021,13 @@ static ssize_t move_pages(struct userfaultfd_ctx *ctx, unsigned long dst_start,
 	err = validate_move_areas(ctx, src_vma, dst_vma);
 	if (err)
 		goto out_unlock;
+
+	/* Do not move a breakpoint away from its registered virtual address. */
+	if (aprobe_range_active(mm, src_start, src_start + len) ||
+	    aprobe_range_active(mm, dst_start, dst_start + len)) {
+		err = -EBUSY;
+		goto out_unlock;
+	}
 
 	for (src_addr = src_start, dst_addr = dst_start, src_end = src_start + len;
 	     src_addr < src_end;) {

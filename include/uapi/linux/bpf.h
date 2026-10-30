@@ -1373,6 +1373,8 @@ enum {
 
 	/* Get path from provided path_fd. */
 	BPF_F_UPROBE_MULTI_PATH_FD    = (1U << 1),
+	/* Use virtual addresses in the process specified by pid; no path. */
+	BPF_F_UPROBE_MULTI_APROBE     = (1U << 2),
 };
 
 /* link_create.netfilter.flags used in LINK_CREATE command for

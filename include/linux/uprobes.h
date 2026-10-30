@@ -12,6 +12,7 @@
  */
 
 #include <linux/errno.h>
+#include <linux/atomic.h>
 #include <linux/rbtree.h>
 #include <linux/types.h>
 #include <linux/wait.h>
@@ -187,6 +188,8 @@ struct xol_area;
 
 struct uprobes_state {
 	struct xol_area		*xol_area;
+	struct rb_root		aprobes;
+	atomic_t		aprobe_allocated;
 };
 
 typedef int (*uprobe_write_verify_t)(struct page *page, unsigned long vaddr,
@@ -205,6 +208,12 @@ extern int uprobe_write(struct arch_uprobe *auprobe, struct vm_area_struct *vma,
 			uprobe_opcode_t *insn, int nbytes, uprobe_write_verify_t verify, bool is_register, bool do_update_ref_ctr,
 			void *data);
 extern struct uprobe *uprobe_register(struct inode *inode, loff_t offset, loff_t ref_ctr_offset, struct uprobe_consumer *uc);
+struct uprobe *aprobe_register(struct mm_struct *mm, unsigned long address,
+			      struct uprobe_consumer *uc);
+int aprobe_dup_mmap(struct mm_struct *oldmm, struct mm_struct *newmm);
+void aprobe_munmap(struct vm_area_struct *vma, unsigned long start, unsigned long end);
+int aprobe_clear_range(struct vm_area_struct *vma, unsigned long start, unsigned long end);
+bool aprobe_range_active(struct mm_struct *mm, unsigned long start, unsigned long end);
 extern int uprobe_apply(struct uprobe *uprobe, struct uprobe_consumer *uc, bool);
 extern void uprobe_unregister_nosync(struct uprobe *uprobe, struct uprobe_consumer *uc);
 extern void uprobe_unregister_sync(void);
@@ -284,6 +293,25 @@ static inline void
 uprobe_dup_mmap(struct mm_struct *oldmm, struct mm_struct *newmm)
 {
 }
+static inline int aprobe_dup_mmap(struct mm_struct *oldmm, struct mm_struct *newmm)
+{
+	return 0;
+}
+static inline void aprobe_munmap(struct vm_area_struct *vma,
+				 unsigned long start, unsigned long end)
+{
+}
+static inline int aprobe_clear_range(struct vm_area_struct *vma,
+				unsigned long start, unsigned long end)
+{
+	return 0;
+}
+static inline bool aprobe_range_active(struct mm_struct *mm,
+				      unsigned long start, unsigned long end)
+{
+	return false;
+}
+
 static inline void uprobe_notify_resume(struct pt_regs *regs)
 {
 }
